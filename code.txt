@@ -1,0 +1,224 @@
+#include <Arduino.h>
+#include <Servo.h>
+#include <LiquidCrystal.h>
+
+// --- Pin Definitions ---
+
+// Analog Inputs
+#define GAS_PIN A0    // MQ Gas Sensor
+#define TMP36_PIN A1  // TMP36 Temperature Sensor
+#define LDR_PIN A2    // Photoresistor (LDR)
+
+// Digital Inputs / Outputs
+#define PIR_PIN 2     // PIR Motion Sensor
+#define ECHO_PIN 4    // Ultrasonic Echo
+#define TRIG_PIN 7    // Ultrasonic Trig
+
+// PWM Outputs (Note: Servo library disables PWM on pins 9 and 10)
+#define FAN1_PIN 3    // DC Motor 1 (via MOSFET)
+#define FAN2_PIN 5    // DC Motor 2 (via MOSFET)
+#define BULB1_PIN 6   // Light Bulb 1 (via MOSFET)
+#define BULB2_PIN 11  // Light Bulb 2 (via MOSFET)
+
+// Servo Outputs
+#define SERVO1_PIN 9  // Door 1
+#define SERVO2_PIN 10 // Door 2
+
+// LCD Pins (Parallel 4-bit mode)
+#define LCD_RS 8
+#define LCD_EN 12
+#define LCD_D4 13
+#define LCD_D5 A3
+#define LCD_D6 A4
+#define LCD_D7 A5
+
+// --- Global Objects ---
+LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+Servo door1;
+Servo door2;
+
+// --- Thresholds & Settings ---
+const int GAS_THRESHOLD = 400;         // Adjust based on your specific gas sensor calibration
+const int DISTANCE_THRESHOLD = 50;     // Distance in cm to open the door
+const unsigned long PIR_TIMEOUT = 10000; // 10 seconds of no motion puts system in standby
+
+// --- State Variables ---
+unsigned long lastMotionTime = 0;
+bool systemActive = false;
+unsigned long lastLcdUpdate = 0;
+
+// --- Function Prototypes ---
+float getTemperature();
+long getDistance();
+void handleGasAlarm();
+void handleNormalOperation();
+void handleStandby();
+
+void setup() {
+    Serial.begin(115200);
+
+    // Sensor Pins
+    pinMode(PIR_PIN, INPUT);
+    pinMode(ECHO_PIN, INPUT);
+    pinMode(TRIG_PIN, OUTPUT);
+
+    // Actuator Pins
+    pinMode(FAN1_PIN, OUTPUT);
+    pinMode(FAN2_PIN, OUTPUT);
+    pinMode(BULB1_PIN, OUTPUT);
+    pinMode(BULB2_PIN, OUTPUT);
+
+    // Attach Servos
+    door1.attach(SERVO1_PIN);
+    door2.attach(SERVO2_PIN);
+    
+    // Initial State: Doors closed
+    door1.write(0); 
+    door2.write(0);
+
+    // Initialize LCD
+    lcd.begin(16, 2);
+    lcd.setCursor(0, 0);
+    lcd.print("Smart Home Init");
+    delay(2000);
+    lcd.clear();
+}
+
+void loop() {
+    // 1. Safety First: Check Gas Sensor
+    int gasLevel = analogRead(GAS_PIN);
+    if (gasLevel > GAS_THRESHOLD) {
+        handleGasAlarm();
+        return; // Skip normal operations while in alarm state
+    }
+
+    // 2. Presence Detection: Check PIR Sensor
+    bool motionDetected = digitalRead(PIR_PIN);
+    if (motionDetected) {
+        lastMotionTime = millis();
+        systemActive = true;
+    } else if (millis() - lastMotionTime > PIR_TIMEOUT) {
+        systemActive = false; // Timeout reached, nobody in the room
+    }
+
+    // 3. Execute State Logic
+    if (systemActive) {
+        handleNormalOperation();
+    } else {
+        handleStandby();
+    }
+
+    delay(100); // Small delay for stability
+}
+
+// Reads TMP36 and returns temperature in Celsius
+float getTemperature() {
+    int reading = analogRead(TMP36_PIN);
+    float voltage = reading * 5.0 / 1024.0;
+    float tempC = (voltage - 0.5) * 100.0;
+    return tempC;
+}
+
+// Reads Ultrasonic sensor and returns distance in cm
+long getDistance() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout (~5 meters)
+    if (duration == 0) return 999; // No echo received
+    
+    return duration * 0.034 / 2; // Speed of sound wave divided by 2 (go and back)
+}
+
+// Emergency state logic
+void handleGasAlarm() {
+    // Open doors for ventilation
+    door1.write(90); 
+    door2.write(90);
+    
+    // Turn on fans to maximum to clear gas
+    analogWrite(FAN1_PIN, 255);
+    analogWrite(FAN2_PIN, 255);
+    
+    // Turn on bulbs as emergency indicator
+    analogWrite(BULB1_PIN, 255);
+    analogWrite(BULB2_PIN, 255);
+
+    // Update LCD
+    if (millis() - lastLcdUpdate > 500) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("! GAS LEAK !");
+        lcd.setCursor(0, 1);
+        lcd.print("EVACUATE ROOM");
+        lastLcdUpdate = millis();
+    }
+}
+
+// Normal active state logic (someone is in the room)
+void handleNormalOperation() {
+    // --- Light Control ---
+    // Read LDR (Assuming standard voltage divider: dark = low value, bright = high value)
+    int ldrValue = analogRead(LDR_PIN);
+    // Map LDR value inversely to PWM (Dark room -> High PWM, Bright room -> Low PWM)
+    int bulbPwm = map(ldrValue, 0, 1023, 255, 0);
+    bulbPwm = constrain(bulbPwm, 0, 255);
+    analogWrite(BULB1_PIN, bulbPwm);
+    analogWrite(BULB2_PIN, bulbPwm);
+
+    // --- Temperature Control ---
+    float tempC = getTemperature();
+    int fanPwm = 0;
+    if (tempC > 25.0) { // Start fans if temp is above 25C
+        fanPwm = map(tempC, 25, 40, 100, 255); // Ramp up from 100 to 255 PWM
+        fanPwm = constrain(fanPwm, 100, 255);
+    }
+    analogWrite(FAN1_PIN, fanPwm);
+    analogWrite(FAN2_PIN, fanPwm);
+
+    // --- Door Control ---
+    long distance = getDistance();
+    if (distance < DISTANCE_THRESHOLD) {
+        door1.write(90); // Open
+        door2.write(90);
+    } else {
+        door1.write(0);  // Close
+        door2.write(0);
+    }
+
+    // --- Status Display ---
+    if (millis() - lastLcdUpdate > 1000) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Temp: "); 
+        lcd.print(tempC, 1); 
+        lcd.print("C");
+        lcd.setCursor(0, 1);
+        lcd.print("System Active");
+        lastLcdUpdate = millis();
+    }
+}
+
+// Standby logic (nobody in the room)
+void handleStandby() {
+    // Turn off everything
+    door1.write(0);
+    door2.write(0);
+    analogWrite(FAN1_PIN, 0);
+    analogWrite(FAN2_PIN, 0);
+    analogWrite(BULB1_PIN, 0);
+    analogWrite(BULB2_PIN, 0);
+
+    // Update LCD
+    if (millis() - lastLcdUpdate > 1000) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("System Standby");
+        lcd.setCursor(0, 1);
+        lcd.print("Power Saving...");
+        lastLcdUpdate = millis();
+    }
+}
